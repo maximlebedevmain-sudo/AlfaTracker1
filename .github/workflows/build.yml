@@ -1,0 +1,589 @@
+name: Build AlfaTracker APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Generate project files
+        run: |
+          mkdir -p app/src/main/java/com/alfatracker
+
+          cat << 'EOF' > gradle.properties
+          org.gradle.jvmargs=-Xmx2048m
+          EOF
+
+          cat << 'EOF' > settings.gradle
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "AlfaTracker"
+          include ':app'
+          EOF
+
+          cat << 'EOF' > build.gradle
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+          }
+          EOF
+
+          cat << 'EOF' > app/build.gradle
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+
+          android {
+              namespace 'com.alfatracker'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "com.alfatracker"
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.RECEIVE_SMS" />
+              <uses-permission android:name="android.permission.READ_SMS" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@android:drawable/ic_dialog_info"
+                  android:label="AlfaTracker"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".AlfaNotificationService"
+                      android:exported="true"
+                      android:label="AlfaTracker Push"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                  </service>
+
+                  <receiver
+                      android:name=".AlfaSmsReceiver"
+                      android:exported="true"
+                      android:permission="android.permission.BROADCAST_SMS">
+                      <intent-filter android:priority="999">
+                          <action android:name="android.provider.Telephony.SMS_RECEIVED" />
+                      </intent-filter>
+                  </receiver>
+
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/alfatracker/MainActivity.kt
+          package com.alfatracker
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.provider.Telephony
+          import android.service.notification.NotificationListenerService
+          import android.service.notification.StatusBarNotification
+          import android.text.InputType
+          import android.widget.*
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.OutputStreamWriter
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.text.SimpleDateFormat
+          import java.util.*
+          import java.util.concurrent.Executors
+
+          class MainActivity : Activity() {
+
+              private lateinit var logView: TextView
+              private lateinit var aiKeyInput: EditText
+              private lateinit var categoriesInput: EditText
+              private lateinit var tgTokenInput: EditText
+              private lateinit var tgChatInput: EditText
+              private lateinit var sheetUrlInput: EditText
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val prefs = getSharedPreferences("alfa_prefs", Context.MODE_PRIVATE)
+                  val scroll = ScrollView(this)
+                  val layout = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(48, 64, 48, 64)
+                  }
+
+                  fun addLabel(text: String) {
+                      layout.addView(TextView(this).apply {
+                          this.text = text
+                          textSize = 14f
+                          setTypeface(null, Typeface.BOLD)
+                          setPadding(0, 22, 0, 6)
+                      })
+                  }
+
+                  fun createInput(hintText: String, prefKey: String, isSecret: Boolean = false): EditText {
+                      return EditText(this).apply {
+                          hint = hintText
+                          setText(prefs.getString(prefKey, ""))
+                          if (isSecret) {
+                              inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                          }
+                          layout.addView(this)
+                      }
+                  }
+
+                  layout.addView(TextView(this).apply {
+                      text = "AlfaTracker AI"
+                      textSize = 24f
+                      setTypeface(null, Typeface.BOLD)
+                      setTextColor(Color.parseColor("#EF3124"))
+                  })
+
+                  addLabel("API-ключ (Gemini AIza... или Claude sk-ant-...):")
+                  aiKeyInput = createInput("Вставьте ключ нейросети", "ai_key", true)
+
+                  addLabel("Категории (через запятую):")
+                  categoriesInput = createInput("Продукты, Кафе, Транспорт...", "categories")
+                  if (categoriesInput.text.isEmpty()) {
+                      categoriesInput.setText("Продукты, Кафе, Транспорт, Дом, Маркетплейсы, Здоровье, Связь, Переводы, Прочее")
+                  }
+
+                  addLabel("Telegram Bot Token (необязательно):")
+                  tgTokenInput = createInput("123456:ABC-DEF...", "tg_token", true)
+
+                  addLabel("Telegram Chat ID (можно оставить пустым — определится сам после /start боту):")
+                  tgChatInput = createInput("Автоопределение", "tg_chat")
+
+                  addLabel("Ссылка Google Apps Script (необязательно):")
+                  sheetUrlInput = createInput("https://script.google.com/macros/s/.../exec", "sheet_url")
+
+                  layout.addView(Button(this).apply {
+                      text = "Сохранить настройки"
+                      setOnClickListener {
+                          saveSettings()
+                          Toast.makeText(this@MainActivity, "Сохранено", Toast.LENGTH_SHORT).show()
+                      }
+                  })
+
+                  layout.addView(Button(this).apply {
+                      text = "1. Включить доступ к Push-уведомлениям"
+                      setOnClickListener {
+                          saveSettings()
+                          startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                      }
+                  })
+
+                  layout.addView(Button(this).apply {
+                      text = "2. Разрешить чтение СМС"
+                      setOnClickListener {
+                          saveSettings()
+                          requestPermissions(arrayOf(Manifest.permission.RECEIVE_SMS, Manifest.permission.READ_SMS), 101)
+                      }
+                  })
+
+                  layout.addView(Button(this).apply {
+                      text = "Проверить работу (тестовая покупка)"
+                      setOnClickListener {
+                          saveSettings()
+                          Toast.makeText(this@MainActivity, "Отправляю в нейросеть...", Toast.LENGTH_SHORT).show()
+                          TransactionProcessor.processMessage(
+                              applicationContext,
+                              "Тест Альфа-Банк",
+                              "Покупка по карте *4512 на сумму 640 RUB в PYATEROCHKA. Баланс: 24500.00 RUB"
+                          ) {
+                              runOnUiThread {
+                                  val savedChat = getSharedPreferences("alfa_prefs", Context.MODE_PRIVATE).getString("tg_chat", "")
+                                  if (!savedChat.isNullOrBlank()) tgChatInput.setText(savedChat)
+                                  refreshLog()
+                              }
+                          }
+                      }
+                  })
+
+                  addLabel("Журнал операций:")
+                  logView = TextView(this).apply {
+                      textSize = 13f
+                      setPadding(0, 8, 0, 32)
+                  }
+                  layout.addView(logView)
+
+                  scroll.addView(layout)
+                  setContentView(scroll)
+                  refreshLog()
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  refreshLog()
+              }
+
+              private fun saveSettings() {
+                  getSharedPreferences("alfa_prefs", Context.MODE_PRIVATE).edit()
+                      .putString("ai_key", aiKeyInput.text.toString().trim())
+                      .putString("categories", categoriesInput.text.toString().trim())
+                      .putString("tg_token", tgTokenInput.text.toString().trim())
+                      .putString("tg_chat", tgChatInput.text.toString().trim())
+                      .putString("sheet_url", sheetUrlInput.text.toString().trim())
+                      .apply()
+              }
+
+              private fun refreshLog() {
+                  val prefs = getSharedPreferences("alfa_prefs", Context.MODE_PRIVATE)
+                  logView.text = prefs.getString("history_log", "Записей пока нет. Вставьте API-ключ и нажмите «Проверить работу».")
+              }
+          }
+
+          class AlfaNotificationService : NotificationListenerService() {
+              override fun onNotificationPosted(sbn: StatusBarNotification?) {
+                  if (sbn == null) return
+                  val pkg = sbn.packageName ?: ""
+                  if (pkg == "com.alfatracker") return
+
+                  val extras = sbn.notification?.extras ?: return
+                  val title = extras.getCharSequence("android.title")?.toString() ?: ""
+                  val text = extras.getCharSequence("android.bigText")?.toString()
+                      ?: extras.getCharSequence("android.text")?.toString() ?: ""
+
+                  if (text.isBlank()) return
+
+                  val isAlfa = pkg.contains("alfa", ignoreCase = true) ||
+                      title.contains("Альфа", ignoreCase = true) ||
+                      title.contains("Alfa", ignoreCase = true) ||
+                      text.contains("Альфа-Банк", ignoreCase = true) ||
+                      text.contains("Alfa-Bank", ignoreCase = true)
+
+                  if (isAlfa) {
+                      TransactionProcessor.processMessage(applicationContext, "Push ($title)", text)
+                  }
+              }
+          }
+
+          class AlfaSmsReceiver : BroadcastReceiver() {
+              override fun onReceive(context: Context, intent: Intent) {
+                  if (intent.action != Telephony.Sms.Intents.SMS_RECEIVED_ACTION) return
+                  val messages = Telephony.Sms.Intents.getMessagesFromIntent(intent) ?: return
+                  if (messages.isEmpty()) return
+
+                  val sender = messages[0].originatingAddress ?: ""
+                  val fullBody = messages.joinToString(separator = "") { it.messageBody ?: "" }
+
+                  val isAlfa = sender.contains("Alfa", ignoreCase = true) ||
+                      sender.contains("Альфа", ignoreCase = true) ||
+                      fullBody.contains("Alfa-Bank", ignoreCase = true) ||
+                      fullBody.contains("Альфа-Банк", ignoreCase = true)
+
+                  if (isAlfa) {
+                      TransactionProcessor.processMessage(context.applicationContext, "SMS ($sender)", fullBody)
+                  }
+              }
+          }
+
+          object TransactionProcessor {
+              private val executor = Executors.newSingleThreadExecutor()
+              private var lastMessageText = ""
+              private var lastMessageTime = 0L
+
+              fun processMessage(
+                  context: Context,
+                  source: String,
+                  rawText: String,
+                  onDone: (() -> Unit)? = null
+              ) {
+                  val cleanText = rawText.trim()
+                  if (!cleanText.any { it.isDigit() }) {
+                      onDone?.invoke()
+                      return
+                  }
+                  val lower = cleanText.lowercase(Locale.getDefault())
+                  if (lower.contains("никому не говорите") ||
+                      lower.contains("код подтверждения") ||
+                      lower.contains("одноразовый код") ||
+                      lower.contains("код для входа")
+                  ) {
+                      onDone?.invoke()
+                      return
+                  }
+
+                  val now = System.currentTimeMillis()
+                  synchronized(this) {
+                      if (cleanText == lastMessageText && (now - lastMessageTime) < 90_000) {
+                          onDone?.invoke()
+                          return
+                      }
+                      lastMessageText = cleanText
+                      lastMessageTime = now
+                  }
+
+                  executor.execute {
+                      try {
+                          val prefs = context.getSharedPreferences("alfa_prefs", Context.MODE_PRIVATE)
+                          val apiKey = prefs.getString("ai_key", "") ?: ""
+                          val categories = prefs.getString("categories", "Продукты, Кафе, Транспорт, Дом, Прочее") ?: "Прочее"
+
+                          if (apiKey.isBlank()) {
+                              appendLog(context, "Ошибка: не указан API-ключ нейросети.")
+                              return@execute
+                          }
+
+                          val aiJson = callAiApi(apiKey, categories, cleanText)
+                          if (!aiJson.optBoolean("is_transaction", true)) {
+                              appendLog(context, "Пропущено (не трата): $cleanText")
+                              return@execute
+                          }
+
+                          val type = aiJson.optString("type", "Расход")
+                          val amount = aiJson.optDouble("amount", 0.0)
+                          val currency = aiJson.optString("currency", "RUB")
+                          val merchant = aiJson.optString("merchant", "Неизвестно")
+                          val category = aiJson.optString("category", "Прочее")
+                          val dateStr = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
+
+                          appendLog(context, "[$dateStr] $type: $amount $currency | $merchant -> $category ($source)")
+
+                          val tgToken = prefs.getString("tg_token", "") ?: ""
+                          var tgChat = prefs.getString("tg_chat", "") ?: ""
+                          if (tgToken.isNotBlank()) {
+                              if (tgChat.isBlank()) {
+                                  tgChat = detectTelegramChatId(tgToken)
+                                  if (tgChat.isNotBlank()) {
+                                      prefs.edit().putString("tg_chat", tgChat).apply()
+                                  }
+                              }
+                              if (tgChat.isNotBlank()) {
+                                  sendToTelegram(
+                                      tgToken,
+                                      tgChat,
+                                      "🅰️ $type: $amount $currency\nМагазин: $merchant\nКатегория: $category\nИсточник: $source"
+                                  )
+                              }
+                          }
+
+                          val sheetUrl = prefs.getString("sheet_url", "") ?: ""
+                          if (sheetUrl.isNotBlank()) {
+                              sendToGoogleSheet(sheetUrl, dateStr, type, amount, currency, merchant, category, cleanText)
+                          }
+                      } catch (e: Exception) {
+                          appendLog(context, "Ошибка: ${e.message}")
+                      } finally {
+                          onDone?.invoke()
+                      }
+                  }
+              }
+
+              private fun callAiApi(apiKey: String, categories: String, rawText: String): JSONObject {
+                  val prompt = """
+                      Ты финансовый парсер уведомлений Альфа-Банка.
+                      Верни ТОЛЬКО чистый JSON без markdown:
+                      {
+                        "is_transaction": true/false,
+                        "type": "Расход" или "Доход" или "Перевод",
+                        "amount": число,
+                        "currency": "RUB",
+                        "merchant": "Магазин или получатель",
+                        "category": "Одна категория из списка: $categories"
+                      }
+                      Текст: "$rawText"
+                  """.trimIndent()
+
+                  val rawResponse = if (apiKey.startsWith("sk-ant-")) {
+                      callClaude(apiKey, prompt)
+                  } else {
+                      callGemini(apiKey, prompt)
+                  }
+
+                  val cleaned = rawResponse.replace("```json", "").replace("```", "").trim()
+                  val startIdx = cleaned.indexOf("{")
+                  val endIdx = cleaned.lastIndexOf("}")
+                  if (startIdx == -1 || endIdx == -1) throw Exception("Некорректный ответ ИИ: $rawResponse")
+                  return JSONObject(cleaned.substring(startIdx, endIdx + 1))
+              }
+
+              private fun callGemini(apiKey: String, prompt: String): String {
+                  val url = URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey")
+                  val conn = (url.openConnection() as HttpURLConnection).apply {
+                      requestMethod = "POST"
+                      setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+                      connectTimeout = 15000
+                      readTimeout = 15000
+                      doOutput = true
+                  }
+                  val payload = JSONObject().put(
+                      "contents", JSONArray().put(
+                          JSONObject().put("parts", JSONArray().put(JSONObject().put("text", prompt)))
+                      )
+                  )
+                  OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { it.write(payload.toString()) }
+                  val code = conn.responseCode
+                  val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                  val responseText = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
+                  if (code !in 200..299) throw Exception("Gemini HTTP $code: $responseText")
+                  return JSONObject(responseText)
+                      .getJSONArray("candidates").getJSONObject(0)
+                      .getJSONObject("content").getJSONArray("parts")
+                      .getJSONObject(0).getString("text")
+              }
+
+              private fun callClaude(apiKey: String, prompt: String): String {
+                  val url = URL("https://api.anthropic.com/v1/messages")
+                  val conn = (url.openConnection() as HttpURLConnection).apply {
+                      requestMethod = "POST"
+                      setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+                      setRequestProperty("x-api-key", apiKey)
+                      setRequestProperty("anthropic-version", "2023-06-01")
+                      connectTimeout = 15000
+                      readTimeout = 15000
+                      doOutput = true
+                  }
+                  val payload = JSONObject().apply {
+                      put("model", "claude-3-5-haiku-latest")
+                      put("max_tokens", 300)
+                      put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
+                  }
+                  OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { it.write(payload.toString()) }
+                  val code = conn.responseCode
+                  val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                  val responseText = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
+                  if (code !in 200..299) throw Exception("Claude HTTP $code: $responseText")
+                  return JSONObject(responseText).getJSONArray("content").getJSONObject(0).getString("text")
+              }
+
+              private fun detectTelegramChatId(token: String): String {
+                  return try {
+                      val url = URL("https://api.telegram.org/bot$token/getUpdates")
+                      val conn = (url.openConnection() as HttpURLConnection).apply {
+                          connectTimeout = 10000
+                          readTimeout = 10000
+                      }
+                      val text = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+                      val results = JSONObject(text).optJSONArray("result") ?: return ""
+                      for (i in results.length() - 1 downTo 0) {
+                          val msg = results.getJSONObject(i).optJSONObject("message")
+                          val id = msg?.optJSONObject("chat")?.optLong("id", 0L) ?: 0L
+                          if (id != 0L) return id.toString()
+                      }
+                      ""
+                  } catch (_: Exception) {
+                      ""
+                  }
+              }
+
+              private fun sendToTelegram(token: String, chatId: String, message: String) {
+                  val url = URL("https://api.telegram.org/bot$token/sendMessage")
+                  val conn = (url.openConnection() as HttpURLConnection).apply {
+                      requestMethod = "POST"
+                      setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+                      doOutput = true
+                  }
+                  val body = JSONObject().put("chat_id", chatId).put("text", message)
+                  OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { it.write(body.toString()) }
+                  conn.responseCode
+              }
+
+              private fun sendToGoogleSheet(
+                  webhookUrl: String,
+                  date: String,
+                  type: String,
+                  amount: Double,
+                  currency: String,
+                  merchant: String,
+                  category: String,
+                  rawText: String
+              ) {
+                  val url = URL(webhookUrl)
+                  val conn = (url.openConnection() as HttpURLConnection).apply {
+                      requestMethod = "POST"
+                      setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+                      instanceFollowRedirects = true
+                      doOutput = true
+                  }
+                  val body = JSONObject().apply {
+                      put("date", date)
+                      put("type", type)
+                      put("amount", amount)
+                      put("currency", currency)
+                      put("merchant", merchant)
+                      put("category", category)
+                      put("raw", rawText)
+                  }
+                  OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { it.write(body.toString()) }
+                  conn.responseCode
+              }
+
+              private fun appendLog(context: Context, entry: String) {
+                  val prefs = context.getSharedPreferences("alfa_prefs", Context.MODE_PRIVATE)
+                  val old = prefs.getString("history_log", "") ?: ""
+                  val lines = (listOf(entry) + old.split("\n").filter { it.isNotBlank() }).take(25)
+                  prefs.edit().putString("history_log", lines.joinToString("\n\n")).apply()
+              }
+          }
+          EOF
+
+      - name: Build Debug APK
+        run: gradle assembleDebug
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AlfaTracker-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
